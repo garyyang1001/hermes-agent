@@ -270,6 +270,87 @@ class TestTelegramApprovalCallback:
         # State should be cleaned up
         assert 1 not in adapter._approval_state
 
+
+class TestTelegramMessageCallback:
+    """Test generic plugin inline buttons that route back into gateway messages."""
+
+    @pytest.mark.asyncio
+    async def test_message_callback_dispatches_command(self):
+        adapter = _make_adapter()
+        adapter._bot.username = "sc_boss_cord_bot"
+        runner = _AuthRunner(authorized=True)
+        adapter._message_handler = runner._handle_message
+        adapter.handle_message = AsyncMock()
+
+        query = SimpleNamespace(
+            id="cb-1",
+            data="hm:/sc_schedule_check",
+            from_user=SimpleNamespace(
+                id="42",
+                first_name="Gary",
+                full_name="Gary Yang",
+                username="garyyang",
+                is_bot=False,
+            ),
+            message=SimpleNamespace(
+                chat_id="-1001",
+                chat=SimpleNamespace(
+                    id="-1001",
+                    type="supergroup",
+                    title="STUDY CENTRAL",
+                    is_forum=False,
+                ),
+                message_id=77,
+                message_thread_id=None,
+                is_topic_message=False,
+            ),
+            answer=AsyncMock(),
+        )
+        update = SimpleNamespace(callback_query=query, update_id=5001)
+
+        await adapter._handle_callback_query(update, SimpleNamespace())
+
+        query.answer.assert_awaited_once_with(text="收到")
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        assert event.text == "/sc_schedule_check"
+        assert event.message_type.value == "command"
+        assert event.source.chat_id == "-1001"
+        assert event.source.user_id == "42"
+
+    @pytest.mark.asyncio
+    async def test_message_callback_requires_authorized_user(self):
+        adapter = _make_adapter()
+        adapter._bot.username = "sc_boss_cord_bot"
+        runner = _AuthRunner(authorized=False)
+        adapter._message_handler = runner._handle_message
+        adapter.handle_message = AsyncMock()
+
+        query = SimpleNamespace(
+            id="cb-2",
+            data="hm:/sc_schedule_check",
+            from_user=SimpleNamespace(id="99", first_name="Stranger"),
+            message=SimpleNamespace(
+                chat_id="-1001",
+                chat=SimpleNamespace(
+                    id="-1001",
+                    type="supergroup",
+                    title="STUDY CENTRAL",
+                    is_forum=False,
+                ),
+                message_id=78,
+                message_thread_id=None,
+                is_topic_message=False,
+            ),
+            answer=AsyncMock(),
+        )
+        update = SimpleNamespace(callback_query=query, update_id=5002)
+
+        await adapter._handle_callback_query(update, SimpleNamespace())
+
+        query.answer.assert_awaited_once_with(text="⛔ You are not authorized to use this button.")
+        adapter.handle_message.assert_not_awaited()
+
     @pytest.mark.asyncio
     async def test_resume_typing_after_inline_approval(self):
         """Clicking an inline approval button must un-pause the chat's typing.

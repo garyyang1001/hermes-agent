@@ -17,6 +17,7 @@ import html as _html
 import re
 import threading
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import Dict, List, Optional, Set, Any
 
 logger = logging.getLogger(__name__)
@@ -5288,6 +5289,66 @@ class TelegramAdapter(BasePlatformAdapter):
         except Exception:
             pass
 
+    async def _handle_message_callback(
+        self,
+        query: Any,
+        data: str,
+        update: "Update",
+        *,
+        query_chat_id: Any,
+        query_chat_type: Any,
+        query_thread_id: Any,
+        query_user_name: Any,
+    ) -> None:
+        """Turn a narrow inline-button callback into a normal gateway message.
+
+        The ``hm:`` prefix is intentionally small and command-only. It lets
+        plugin-rendered Telegram inline buttons call back into the same gateway
+        dispatch path without depending on group privacy settings to deliver a
+        plain text button label.
+        """
+        text = data.removeprefix("hm:").strip()
+        if not text.startswith("/"):
+            await query.answer(text="Invalid action.")
+            return
+
+        caller_id = str(getattr(query.from_user, "id", ""))
+        if not self._is_callback_user_authorized(
+            caller_id,
+            chat_id=query_chat_id,
+            chat_type=str(query_chat_type) if query_chat_type is not None else None,
+            thread_id=str(query_thread_id) if query_thread_id is not None else None,
+            user_name=query_user_name,
+        ):
+            await query.answer(text="⛔ You are not authorized to use this button.")
+            return
+
+        query_message = getattr(query, "message", None)
+        if query_message is None:
+            await query.answer(text="This button is no longer available.")
+            return
+
+        await query.answer(text="收到")
+        callback_message = SimpleNamespace(
+            chat=getattr(query_message, "chat", None),
+            from_user=getattr(query, "from_user", None),
+            text=text,
+            message_id=getattr(query_message, "message_id", 0),
+            reply_to_message=None,
+            date=datetime.now(timezone.utc),
+            message_thread_id=getattr(query_message, "message_thread_id", None),
+            is_topic_message=bool(getattr(query_message, "is_topic_message", False)),
+            forum_topic_created=None,
+        )
+        event = self._build_message_event(
+            callback_message,
+            MessageType.COMMAND,
+            update_id=getattr(update, "update_id", None),
+        )
+        event.text = self._clean_bot_trigger_text(event.text)
+        event.message_id = f"callback:{getattr(query, 'id', '') or getattr(query_message, 'message_id', '')}"
+        await self.handle_message(event)
+
     async def _handle_callback_query(
         self, update: "Update", context: "ContextTypes.DEFAULT_TYPE"
     ) -> None:
@@ -5302,6 +5363,19 @@ class TelegramAdapter(BasePlatformAdapter):
         query_chat_type = getattr(query_chat, "type", None)
         query_thread_id = getattr(query_message, "message_thread_id", None)
         query_user_name = getattr(query.from_user, "first_name", None)
+
+        # --- Generic plugin button callbacks (hm:/command_name) ---
+        if data.startswith("hm:"):
+            await self._handle_message_callback(
+                query,
+                data,
+                update,
+                query_chat_id=query_chat_id,
+                query_chat_type=query_chat_type,
+                query_thread_id=query_thread_id,
+                query_user_name=query_user_name,
+            )
+            return
 
         # --- Model picker callbacks ---
         if data.startswith(("mp:", "mpg:", "mpv:", "mm:", "mc:", "mb", "mx", "mg:")):
