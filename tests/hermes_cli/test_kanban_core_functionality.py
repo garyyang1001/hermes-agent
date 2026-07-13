@@ -331,6 +331,68 @@ def test_max_retries_none_falls_through_to_dispatcher_limit(kanban_home, all_ass
         conn.close()
 
 
+def test_stale_timeout_failure_does_not_override_completed_task(kanban_home):
+    """Late timeout bookkeeping must not append ``gave_up`` after success.
+
+    ``enforce_max_runtime`` closes the timed-out run and requeues the task in
+    one transaction, then increments the unified failure counter in another.
+    A worker can complete the now-ready task in that gap.  The completed
+    business outcome is terminal and must win over the stale timeout record.
+    """
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="completed during timeout cleanup", assignee="worker",
+            max_retries=0,
+        )
+        assert kb.complete_task(conn, tid, result="verified delivery") is True
+
+        tripped = kb._record_task_failure(
+            conn, tid,
+            error="elapsed 30s > limit 1s",
+            outcome="timed_out",
+            release_claim=False,
+            end_run=False,
+        )
+
+        task = kb.get_task(conn, tid)
+        assert tripped is False
+        assert task.status == "done"
+        assert task.consecutive_failures == 0
+        assert task.last_failure_error is None
+        assert "gave_up" not in [e.kind for e in kb.list_events(conn, tid)]
+    finally:
+        conn.close()
+
+
+def test_stale_timeout_failure_does_not_touch_new_running_attempt(kanban_home):
+    """Bookkeeping from an old run must not count against a new claim."""
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="reclaimed before timeout cleanup", assignee="worker",
+            max_retries=1,
+        )
+        assert kb.claim_task(conn, tid) is not None
+
+        tripped = kb._record_task_failure(
+            conn, tid,
+            error="stale timeout from previous run",
+            outcome="timed_out",
+            release_claim=False,
+            end_run=False,
+        )
+
+        task = kb.get_task(conn, tid)
+        assert tripped is False
+        assert task.status == "running"
+        assert task.consecutive_failures == 0
+        assert task.last_failure_error is None
+        assert "gave_up" not in [e.kind for e in kb.list_events(conn, tid)]
+    finally:
+        conn.close()
+
+
 def test_workspace_resolution_failure_also_counts(kanban_home, all_assignees_spawnable):
     """`dir:` workspace with no path should fail workspace resolution AND
     count against the failure budget — not just crash the tick."""

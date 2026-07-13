@@ -6799,6 +6799,12 @@ def _record_task_failure(
       counter; if the breaker trips, the task is re-transitioned
       ``ready → blocked`` and a ``gave_up`` event is emitted.
 
+    Failure bookkeeping is deliberately state-conditional.  The spawn path
+    only owns the still-running claim it failed to launch; the timeout/crash
+    path only owns the ready state left by its preceding transaction.  If the
+    task is now ``done`` or a new attempt has already claimed it, this failure
+    belongs to an obsolete run and must not mutate the newer outcome.
+
     ``event_payload_extra`` merges into the ``gave_up`` event payload
     when the breaker trips, so callers can include outcome-specific
     context (e.g. pid on crash, elapsed on timeout).
@@ -6821,6 +6827,9 @@ def _record_task_failure(
             return False
         failures = int(row["consecutive_failures"]) + 1
         cur_status = row["status"]
+        expected_status = "running" if release_claim else "ready"
+        if cur_status != expected_status:
+            return False
 
         # Per-task override wins over both caller-supplied and default
         # thresholds. None (the common case) falls through.
@@ -6842,7 +6851,7 @@ def _record_task_failure(
                     "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
                     "claim_expires = NULL, worker_pid = NULL, "
                     "consecutive_failures = ?, last_failure_error = ? "
-                    "WHERE id = ? AND status IN ('running', 'ready')",
+                    "WHERE id = ? AND status = 'running'",
                     (failures, error[:500], task_id),
                 )
             else:
@@ -6852,7 +6861,7 @@ def _record_task_failure(
                 conn.execute(
                     "UPDATE tasks SET status = 'blocked', "
                     "consecutive_failures = ?, last_failure_error = ? "
-                    "WHERE id = ? AND status IN ('ready', 'running')",
+                    "WHERE id = ? AND status = 'ready'",
                     (failures, error[:500], task_id),
                 )
             run_id = None
@@ -6898,7 +6907,7 @@ def _record_task_failure(
                 # its own UPDATE. Just bookkeep the counter + last error.
                 conn.execute(
                     "UPDATE tasks SET consecutive_failures = ?, "
-                    "last_failure_error = ? WHERE id = ?",
+                    "last_failure_error = ? WHERE id = ? AND status = 'ready'",
                     (failures, error[:500], task_id),
                 )
             if end_run:
