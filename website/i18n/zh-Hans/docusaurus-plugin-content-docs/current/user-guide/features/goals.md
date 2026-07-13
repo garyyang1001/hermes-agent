@@ -31,9 +31,9 @@ description: "设置一个持续目标，让 Hermes 跨轮次持续工作直到�
 
 1. **目标已接受** — `⊙ Goal set (20-turn budget): <your goal>`
 2. **第 1 轮运行** — Hermes 开始工作，就像你发送了一条普通消息一样。
-3. **裁判运行** — 轮次结束后，裁判模型判定 `done` 或 `continue`。
+3. **裁判运行** — 轮次结束后，裁判模型判定 `done`、`blocked`、`wait` 或 `continue`。
 4. **若需要则触发循环** — 若为 `continue`，你将看到 `↻ Continuing toward goal (1/20): <judge's reason>`，Hermes 自动执行下一步。
-5. **终止** — 最终你会看到 `✓ Goal achieved: <reason>` 或 `⏸ Goal paused — N/20 turns used`。
+5. **终止或停驻** — 最终你会看到 `✓ Goal achieved`、`⚠ Goal blocked`、等待屏障，或轮次预算耗尽后的 `⏸ Goal paused`。
 
 ## 命令
 
@@ -70,9 +70,9 @@ description: "设置一个持续目标，让 Hermes 跨轮次持续工作直到�
 
 - 持续目标文本
 - agent 最新的最终回复（最后约 4 KB 文本）
-- 一个系统 prompt，要求裁判以严格 JSON 格式回复：`{"done": <bool>, "reason": "<one-sentence rationale>"}`
+- 一个系统 prompt，要求裁判以严格 JSON 格式回复，并明确区分 `done`、`blocked`、`wait` 和 `continue`
 
-裁判刻意保守：只有当回复**明确**确认目标已完成、最终交付物已清晰产出，或目标不可达/被阻塞时（视为 DONE 并附带阻塞原因，以免在不可能的任务上消耗预算），才会将目标标记为 `done`。
+裁判刻意保守：只有当回复**明确**确认目标已完成或最终交付物已清晰产出时，才会将目标标记为 `done`。目标不可达、缺少权限或能力、需要用户输入，或命中明确停止条件时，会持久化为独立的 `blocked` 状态。被阻塞的目标会停止自动续行，但不会被报告为已达成；解决阻塞后可执行 `/goal resume` 继续。
 
 ### 失败开放语义
 
