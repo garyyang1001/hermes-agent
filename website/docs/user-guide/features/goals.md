@@ -31,9 +31,9 @@ What you'll see:
 
 1. **Goal accepted** — `⊙ Goal set (20-turn budget): <your goal>`
 2. **Turn 1 runs** — Hermes starts working as if you'd sent the goal as a normal message.
-3. **Judge runs** — after the turn, the judge model decides `done` or `continue`.
+3. **Judge runs** — after the turn, the judge model decides `done`, `blocked`, `wait`, or `continue`.
 4. **Loop fires if needed** — if `continue`, you'll see `↻ Continuing toward goal (1/20): <judge's reason>` and Hermes takes the next step automatically.
-5. **Terminates** — eventually you see either `✓ Goal achieved: <reason>` or `⏸ Goal paused — N/20 turns used`.
+5. **Terminates or parks** — eventually you see `✓ Goal achieved`, `⚠ Goal blocked`, a wait barrier, or `⏸ Goal paused` when the turn budget is exhausted.
 
 ## Commands
 
@@ -137,9 +137,9 @@ After every turn, Hermes calls an auxiliary model with:
 
 - The standing goal text
 - The agent's most recent final response (last ~4 KB of text)
-- A system prompt telling the judge to reply with strict JSON: `{"done": <bool>, "reason": "<one-sentence rationale>"}`
+- A system prompt telling the judge to reply with strict JSON, including a distinct `done`, `blocked`, `wait`, or `continue` verdict
 
-The judge is deliberately conservative: it marks a goal `done` only when the response **explicitly** confirms the goal is complete, when the final deliverable is clearly produced, or when the goal is unachievable/blocked (treated as DONE with a block reason so we don't burn budget on impossible tasks).
+The judge is deliberately conservative: it marks a goal `done` only when the response **explicitly** confirms completion or clearly shows the final deliverable. An unachievable goal, missing authority/capability, required user input, or an explicit stop condition becomes persisted status `blocked` instead. A blocked goal stops autonomous continuation without being reported as an achievement; resolve the blocker and use `/goal resume` to continue.
 
 ### Fail-open semantics
 
@@ -165,7 +165,7 @@ While an agent is already running, `/goal status`, `/goal pause`, `/goal clear`,
 
 ### Persistence
 
-Goal state lives in `SessionDB.state_meta` keyed by `goal:<session_id>`. That means `/resume` picks up right where you left off — set a goal, close your laptop, come back tomorrow, `/resume`, and the goal is still standing exactly as you left it (active, paused, or done).
+Goal state lives in `SessionDB.state_meta` keyed by `goal:<session_id>`. That means `/resume` picks up right where you left off — set a goal, close your laptop, come back tomorrow, `/resume`, and the goal is still standing exactly as you left it (active, paused, blocked, or done).
 
 ### Prompt cache
 

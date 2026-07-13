@@ -90,6 +90,17 @@ class TestParseJudgeResponse:
         v, _, _, _ = _parse_judge_response('{"verdict": "continue", "reason": "r"}')
         assert v == "continue"
 
+    def test_blocked_verdict_is_distinct_from_done(self):
+        from hermes_cli.goals import _parse_judge_response
+
+        v, reason, parse_failed, wait = _parse_judge_response(
+            '{"verdict": "blocked", "reason": "needs production credentials"}'
+        )
+        assert v == "blocked"
+        assert reason == "needs production credentials"
+        assert parse_failed is False
+        assert wait is None
+
     def test_wait_verdict_with_pid(self):
         from hermes_cli.goals import _parse_judge_response
 
@@ -317,6 +328,38 @@ class TestGoalManager:
         assert decision["continuation_prompt"] is None
         assert mgr.state.status == "done"
         assert mgr.state.turns_used == 1
+
+    def test_evaluate_after_turn_blocked_is_not_achievement(self, hermes_home):
+        """A real blocker stops the loop without recording false success."""
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager, load_goal
+
+        mgr = GoalManager(session_id="eval-sid-blocked")
+        mgr.set("deploy the verified release")
+
+        with patch.object(
+            goals,
+            "judge_goal",
+            return_value=("blocked", "production approval is required", False, None),
+        ):
+            decision = mgr.evaluate_after_turn("I need production approval.")
+
+        assert decision["verdict"] == "blocked"
+        assert decision["status"] == "blocked"
+        assert decision["should_continue"] is False
+        assert "achieved" not in decision["message"].lower()
+        assert "blocked" in decision["message"].lower()
+        assert mgr.state.status == "blocked"
+        assert mgr.has_goal()
+        assert "blocked" in mgr.status_line().lower()
+
+        persisted = load_goal("eval-sid-blocked")
+        assert persisted is not None
+        assert persisted.status == "blocked"
+        assert persisted.last_verdict == "blocked"
+
+        mgr.resume()
+        assert mgr.state.status == "active"
 
     def test_evaluate_after_turn_continue_under_budget(self, hermes_home):
         from hermes_cli import goals

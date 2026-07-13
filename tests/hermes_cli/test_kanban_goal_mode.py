@@ -266,6 +266,27 @@ def test_loop_finalize_nudge_when_judge_done_but_open(monkeypatch):
     assert "still open" in turns[0]
 
 
+def test_loop_finalize_nudge_when_judge_blocked_but_open(monkeypatch):
+    """A blocked verdict asks the worker to record its terminal block."""
+    _patch_judge(monkeypatch, ["blocked"])
+    statuses = iter(["running", "blocked"])
+    turns = []
+
+    res = goals.run_kanban_goal_loop(
+        task_id="t4b",
+        goal_text="task",
+        run_turn=lambda p: turns.append(p) or "recorded blocker",
+        task_status_fn=lambda: next(statuses),
+        block_fn=lambda r: pytest.fail("worker should record its own blocker"),
+        max_turns=10,
+        first_response="needs human input",
+    )
+    assert res["outcome"] == "blocked_by_worker"
+    assert len(turns) == 1
+    assert "still open" in turns[0]
+    assert "kanban_block" in turns[0]
+
+
 def test_loop_blocks_when_judge_done_but_never_finalizes(monkeypatch):
     # Judge keeps saying done, worker never calls kanban_complete → block
     # after the single finalize nudge.
