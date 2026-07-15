@@ -135,6 +135,7 @@ BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
+KANBAN_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
 
 
 def _fire_kanban_lifecycle_hook(event: str, task_id: str, **fields: Any) -> None:
@@ -914,6 +915,9 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # Ephemeral capability injected only into the dispatcher-spawned worker.
+    # The database stores a hash on task_runs; get_task()/show never expose it.
+    worker_token: Optional[str] = field(default=None, repr=False, compare=False)
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1227,7 +1231,10 @@ CREATE TABLE IF NOT EXISTS task_runs (
     --          gave_up | reclaimed | (null while still running)
     summary             TEXT,
     metadata            TEXT,
-    error               TEXT
+    error               TEXT,
+    -- SHA-256 of the per-run capability injected into the spawned worker.
+    -- The raw token is never persisted or surfaced by show/list APIs.
+    worker_token_hash   TEXT
 );
 
 -- Files attached to a task (PDFs, images, source documents). The blob
@@ -2015,6 +2022,22 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         "ON task_events(run_id, id)"
     )
 
+    run_table_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'task_runs'"
+    ).fetchone() is not None
+    run_cols = (
+        {row["name"] for row in conn.execute("PRAGMA table_info(task_runs)")}
+        if run_table_exists
+        else set()
+    )
+    if run_table_exists and "worker_token_hash" not in run_cols:
+        _add_column_if_missing(
+            conn,
+            "task_runs",
+            "worker_token_hash",
+            "worker_token_hash TEXT",
+        )
+
     notify_table_exists = conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='kanban_notify_subs'"
     ).fetchone() is not None
@@ -2139,7 +2162,7 @@ _REBUILD_SPECS = {
         " worker_pid INTEGER, max_runtime_seconds INTEGER,"
         " last_heartbeat_at INTEGER, started_at INTEGER NOT NULL,"
         " ended_at INTEGER, outcome TEXT, summary TEXT, metadata TEXT,"
-        " error TEXT)",
+        " error TEXT, worker_token_hash TEXT)",
         (
             "CREATE INDEX idx_runs_task ON task_runs(task_id, started_at)",
             "CREATE INDEX idx_runs_status ON task_runs(status)",
@@ -3185,6 +3208,103 @@ def _current_run_id(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
     return int(row["current_run_id"]) if row and row["current_run_id"] else None
 
 
+def _new_worker_token() -> tuple[str, str]:
+    """Return an ephemeral worker capability and its persisted SHA-256."""
+    token = secrets.token_urlsafe(32)
+    return token, hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def authorize_worker_transition(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    expected_run_id: Optional[int],
+    worker_token: Optional[str],
+) -> bool:
+    """Authenticate a CLI/tool lifecycle mutation for a running task.
+
+    New dispatcher runs carry a per-run capability whose raw value only exists
+    in the spawned worker environment. Legacy in-flight runs have no hash and
+    retain the older exact-run-id check so upgrades do not strand them.
+    Ready/blocked tasks have no active worker and remain manually operable.
+    """
+    row = conn.execute(
+        "SELECT status, current_run_id FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return False
+    if row["status"] != "running":
+        return True
+    current_run_id = row["current_run_id"]
+    if not current_run_id:
+        return False
+    run = conn.execute(
+        "SELECT worker_token_hash, metadata FROM task_runs "
+        "WHERE id = ? AND task_id = ? AND ended_at IS NULL",
+        (int(current_run_id), task_id),
+    ).fetchone()
+    if run is None:
+        return False
+    expected_hash = run["worker_token_hash"]
+    if not expected_hash:
+        # The public ``hermes kanban claim`` command is an operator-driven
+        # workflow.  It deliberately creates a capability-free run so a
+        # later CLI invocation can heartbeat, block, or complete it without
+        # relying on process-local environment variables.  Dispatcher runs
+        # never carry this marker.  Pre-upgrade runs have neither marker nor
+        # hash and retain the exact-run-id compatibility rule below.
+        try:
+            run_metadata = json.loads(run["metadata"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            run_metadata = {}
+        if run_metadata.get("claim_mode") == "manual_cli":
+            return expected_run_id is None or expected_run_id == int(current_run_id)
+        return expected_run_id == int(current_run_id)
+    if expected_run_id != int(current_run_id):
+        return False
+    if not worker_token:
+        return False
+    supplied_hash = hashlib.sha256(worker_token.encode("utf-8")).hexdigest()
+    return secrets.compare_digest(str(expected_hash), supplied_hash)
+
+
+def worker_transition_authenticated(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    expected_run_id: Optional[int],
+    worker_token: Optional[str],
+) -> bool:
+    """Return True only for a capability-authenticated active worker run.
+
+    Unlike :func:`authorize_worker_transition`, this never treats a legacy
+    pre-upgrade run as authenticated. Such runs remain operable so an upgrade
+    does not strand them, but their completion evidence cannot unlock a gate
+    that requires cryptographic worker ownership.
+    """
+    if not expected_run_id or not worker_token:
+        return False
+    row = conn.execute(
+        """
+        SELECT t.status, t.current_run_id, r.worker_token_hash
+          FROM tasks t
+          JOIN task_runs r ON r.id = t.current_run_id AND r.task_id = t.id
+         WHERE t.id = ? AND r.ended_at IS NULL
+        """,
+        (task_id,),
+    ).fetchone()
+    if (
+        row is None
+        or row["status"] != "running"
+        or int(row["current_run_id"] or 0) != int(expected_run_id)
+        or not row["worker_token_hash"]
+    ):
+        return False
+    supplied_hash = hashlib.sha256(worker_token.encode("utf-8")).hexdigest()
+    return secrets.compare_digest(str(row["worker_token_hash"]), supplied_hash)
+
+
 def _synthesize_ended_run(
     conn: sqlite3.Connection,
     task_id: str,
@@ -3375,6 +3495,7 @@ def claim_task(
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    issue_worker_capability: bool = True,
 ) -> Optional[Task]:
     """Atomically transition ``ready -> running``.
 
@@ -3384,6 +3505,13 @@ def claim_task(
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
+    if issue_worker_capability:
+        worker_token, worker_token_hash = _new_worker_token()
+        run_metadata = None
+    else:
+        worker_token = None
+        worker_token_hash = None
+        run_metadata = json.dumps({"claim_mode": "manual_cli"})
     with write_txn(conn):
         # Structural invariant: never transition ready -> running while any
         # parent is not yet 'done'. This is the single enforcement point
@@ -3457,8 +3585,8 @@ def claim_task(
             INSERT INTO task_runs (
                 task_id, profile, step_key, status,
                 claim_lock, claim_expires, max_runtime_seconds,
-                started_at
-            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
+                started_at, worker_token_hash, metadata
+            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?, ?)
             """,
             (
                 task_id,
@@ -3468,6 +3596,8 @@ def claim_task(
                 expires,
                 trow["max_runtime_seconds"] if trow else None,
                 now,
+                worker_token_hash,
+                run_metadata,
             ),
         )
         run_id = run_cur.lastrowid
@@ -3481,6 +3611,8 @@ def claim_task(
             run_id=run_id,
         )
         claimed = get_task(conn, task_id)
+        if claimed is not None:
+            claimed.worker_token = worker_token
     _fire_kanban_lifecycle_hook(
         "kanban_task_claimed",
         task_id,
@@ -3513,6 +3645,7 @@ def claim_review_task(
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
+    worker_token, worker_token_hash = _new_worker_token()
     with write_txn(conn):
         cur = conn.execute(
             """
@@ -3539,8 +3672,8 @@ def claim_review_task(
             INSERT INTO task_runs (
                 task_id, profile, step_key, status,
                 claim_lock, claim_expires, max_runtime_seconds,
-                started_at
-            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
+                started_at, worker_token_hash
+            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?)
             """,
             (
                 task_id,
@@ -3550,6 +3683,7 @@ def claim_review_task(
                 expires,
                 trow["max_runtime_seconds"] if trow else None,
                 now,
+                worker_token_hash,
             ),
         )
         run_id = run_cur.lastrowid
@@ -3563,7 +3697,10 @@ def claim_review_task(
              "source_status": "review"},
             run_id=run_id,
         )
-        return get_task(conn, task_id)
+        claimed = get_task(conn, task_id)
+        if claimed is not None:
+            claimed.worker_token = worker_token
+        return claimed
 
 
 def heartbeat_claim(
@@ -3975,6 +4112,10 @@ class HallucinatedCardsError(ValueError):
         )
 
 
+class ArtifactPreservationError(RuntimeError):
+    """Raised when a declared scratch deliverable cannot be preserved."""
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -3984,6 +4125,7 @@ def complete_task(
     metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
+    worker_token: Optional[str] = None,
 ) -> bool:
     """Transition ``running|ready -> done`` and record ``result``.
 
@@ -4014,6 +4156,12 @@ def complete_task(
     and never blocks.
     """
     now = int(time.time())
+    worker_authenticated = worker_transition_authenticated(
+        conn,
+        task_id,
+        expected_run_id=expected_run_id,
+        worker_token=worker_token,
+    )
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a
@@ -4042,6 +4190,9 @@ def complete_task(
     else:
         verified_cards = []
 
+    metadata = _merge_completion_prose_artifacts(
+        conn, task_id, metadata, summary=summary, result=result,
+    )
     with write_txn(conn):
         if expected_run_id is None:
             cur = conn.execute(
@@ -4080,6 +4231,18 @@ def complete_task(
             )
         if cur.rowcount != 1:
             return False
+        if isinstance(metadata, dict):
+            _persist_scratch_completion_artifacts(conn, task_id, metadata)
+            for stored_path in metadata.pop("_staged_artifacts", []):
+                path = Path(stored_path)
+                _insert_completion_attachment(
+                    conn,
+                    task_id,
+                    filename=path.name,
+                    stored_path=str(path),
+                    size=path.stat().st_size,
+                    created_at=now,
+                )
         run_id = _end_run(
             conn, task_id,
             outcome="completed", status="done",
@@ -4101,11 +4264,17 @@ def complete_task(
         # notifiers and dashboard WS consumers can render it without a
         # second SQL round-trip. First line only, 400 char cap — the
         # full summary stays on the run row.
-        ev_summary = (summary if summary is not None else result) or ""
-        ev_summary = ev_summary.strip().splitlines()[0][:400] if ev_summary else ""
+        full_summary = (summary if summary is not None else result) or ""
+        ev_summary = full_summary.strip().splitlines()[0][:400] if full_summary else ""
         completed_payload: dict = {
             "result_len": len(result) if result else 0,
             "summary": ev_summary or None,
+            "summary_sha256": (
+                hashlib.sha256(full_summary.encode("utf-8")).hexdigest()
+                if full_summary
+                else None
+            ),
+            "worker_authenticated": bool(worker_authenticated and run_id is not None),
         }
         if verified_cards:
             completed_payload["verified_cards"] = verified_cards
@@ -4174,6 +4343,256 @@ def complete_task(
 # Workspace / tmux cleanup
 # ---------------------------------------------------------------------------
 
+
+def _merge_completion_prose_artifacts(
+    conn: sqlite3.Connection,
+    task_id: str,
+    metadata: Optional[dict],
+    *,
+    summary: Optional[str],
+    result: Optional[str],
+) -> Optional[dict]:
+    """Promote existing scratch files named in legacy completion prose.
+
+    ``artifacts=[...]`` is preferred. Older workers only wrote an absolute
+    deliverable path in ``summary``/``result``; discover it while scratch still
+    exists so cleanup cannot erase the file the user was promised.
+    """
+    row = conn.execute(
+        "SELECT workspace_kind, workspace_path FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if not row or row["workspace_kind"] != "scratch" or not row["workspace_path"]:
+        return metadata
+    workspace = Path(row["workspace_path"]).expanduser()
+    if not _is_managed_scratch_path(workspace):
+        return metadata
+    text = "\n".join(part for part in (summary, result) if part)
+    if not text:
+        return metadata
+    prefix = re.escape(str(workspace))
+    discovered: list[str] = []
+    for match in re.finditer(prefix + r"(?:[/\\][^\s`\"'<>]+)", text):
+        raw = match.group(0).rstrip(".,;:!?)]}")
+        candidate = Path(raw)
+        if candidate.is_file():
+            discovered.append(str(candidate))
+    if not discovered:
+        return metadata
+    updated = dict(metadata) if isinstance(metadata, dict) else {}
+    existing = updated.get("artifacts")
+    merged = list(existing) if isinstance(existing, (list, tuple)) else []
+    seen = {str(path) for path in merged}
+    for path in discovered:
+        if path not in seen:
+            merged.append(path)
+            seen.add(path)
+    updated["artifacts"] = merged
+    return updated
+
+
+def _persist_scratch_completion_artifacts(
+    conn: sqlite3.Connection,
+    task_id: str,
+    metadata: dict,
+) -> None:
+    """Copy scratch-workspace completion artifacts before cleanup removes them."""
+    raw_artifacts = metadata.get("artifacts")
+    if not isinstance(raw_artifacts, (list, tuple)):
+        return
+
+    row = conn.execute(
+        "SELECT workspace_kind, workspace_path FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if not row or row["workspace_kind"] != "scratch" or not row["workspace_path"]:
+        return
+
+    workspace = Path(row["workspace_path"]).expanduser()
+    is_managed, board = _managed_scratch_path_info(workspace)
+    if not is_managed:
+        return
+
+    try:
+        workspace_root = workspace.resolve()
+    except OSError:
+        return
+
+    attachment_dir = task_attachments_dir(task_id, board=board)
+    persisted: list[str] = []
+    used_destinations: set[Path] = set()
+    changed = False
+
+    def _discard_copies() -> None:
+        for copied in used_destinations:
+            try:
+                copied.unlink(missing_ok=True)
+            except OSError:
+                pass
+        try:
+            attachment_dir.rmdir()
+        except OSError:
+            pass
+
+    for item in raw_artifacts:
+        artifact = str(item).strip() if isinstance(item, str) else ""
+        if not artifact:
+            continue
+        src = Path(artifact).expanduser()
+        try:
+            resolved_src = src.resolve()
+        except OSError:
+            persisted.append(artifact)
+            continue
+
+        if not resolved_src.is_relative_to(workspace_root):
+            persisted.append(artifact)
+            continue
+
+        if not src.is_file():
+            _discard_copies()
+            raise ArtifactPreservationError(
+                f"declared scratch artifact is unavailable or not a regular file: {artifact}"
+            )
+
+        size = resolved_src.stat().st_size
+        if size > KANBAN_ATTACHMENT_MAX_BYTES:
+            _discard_copies()
+            raise ArtifactPreservationError(
+                f"declared scratch artifact exceeds the "
+                f"{KANBAN_ATTACHMENT_MAX_BYTES}-byte limit: {artifact}"
+            )
+
+        dest: Optional[Path] = None
+        try:
+            attachment_dir.mkdir(parents=True, exist_ok=True)
+            dest = _unique_attachment_path(attachment_dir, resolved_src.name, used_destinations)
+            with resolved_src.open("rb") as source_file, dest.open("xb") as destination_file:
+                copied = 0
+                while chunk := source_file.read(1024 * 1024):
+                    copied += len(chunk)
+                    if copied > KANBAN_ATTACHMENT_MAX_BYTES:
+                        raise ArtifactPreservationError(
+                            f"declared scratch artifact grew beyond the size limit: {artifact}"
+                        )
+                    destination_file.write(chunk)
+        except Exception as exc:
+            if dest is not None:
+                try:
+                    dest.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            _discard_copies()
+            if isinstance(exc, ArtifactPreservationError):
+                raise
+            raise ArtifactPreservationError(
+                f"could not preserve declared scratch artifact {artifact}: {exc}"
+            ) from exc
+
+        used_destinations.add(dest)
+        persisted.append(str(dest.resolve()))
+        changed = True
+
+    if changed:
+        metadata["artifacts"] = persisted
+        metadata["_staged_artifacts"] = [
+            path for path in persisted if path.startswith(str(attachment_dir.resolve()))
+        ]
+
+
+def _insert_completion_attachment(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    filename: str,
+    stored_path: str,
+    size: int,
+    created_at: int,
+) -> None:
+    """Record a worker-produced artifact in the existing attachment table."""
+    conn.execute(
+        "INSERT INTO task_attachments "
+        "(task_id, filename, stored_path, content_type, size, uploaded_by, created_at) "
+        "VALUES (?, ?, ?, NULL, ?, 'kanban_complete', ?)",
+        (task_id, filename, stored_path, size, created_at),
+    )
+    _append_event(
+        conn,
+        task_id,
+        "attached",
+        {"filename": filename, "size": size, "by": "kanban_complete"},
+    )
+
+
+def _unique_attachment_path(directory: Path, filename: str, used: set[Path]) -> Path:
+    """Return a non-conflicting path under ``directory`` for ``filename``."""
+    safe_name = Path(filename).name or "artifact"
+    candidate = directory / safe_name
+    if candidate not in used and not candidate.exists():
+        return candidate
+
+    stem = Path(safe_name).stem or "artifact"
+    suffix = Path(safe_name).suffix
+    idx = 1
+    while True:
+        candidate = directory / f"{stem}_{idx}{suffix}"
+        if candidate not in used and not candidate.exists():
+            return candidate
+        idx += 1
+
+
+def _managed_scratch_path_info(p: Path) -> tuple[bool, Optional[str]]:
+    """Return whether *p* is managed scratch storage and the matching board."""
+    try:
+        p_abs = p.resolve(strict=False)
+    except OSError:
+        return False, None
+    roots: list[tuple[Path, Optional[str]]] = []
+    override = os.environ.get("HERMES_KANBAN_WORKSPACES_ROOT", "").strip()
+    if override:
+        try:
+            roots.append((Path(override).expanduser().resolve(strict=False), None))
+        except OSError:
+            pass
+    try:
+        home = kanban_home()
+    except OSError:
+        home = None
+    if home is not None:
+        try:
+            roots.append(((home / "kanban" / "workspaces").resolve(strict=False), DEFAULT_BOARD))
+        except OSError:
+            pass
+        try:
+            boards_parent = (home / "kanban" / "boards").resolve(strict=False)
+        except OSError:
+            boards_parent = None
+        if boards_parent is not None:
+            try:
+                entries = list(boards_parent.iterdir())
+            except OSError:
+                entries = []
+            for entry in entries:
+                try:
+                    if not entry.is_dir():
+                        continue
+                except OSError:
+                    continue
+                try:
+                    roots.append(((entry / "workspaces").resolve(strict=False), entry.name))
+                except OSError:
+                    continue
+    for root, board in roots:
+        if p_abs == root:
+            continue
+        try:
+            if p_abs.is_relative_to(root):
+                return True, board
+        except ValueError:
+            continue
+    return False, None
+
+
 def _is_managed_scratch_path(p: Path) -> bool:
     """Return True iff *p* is a strict descendant of a kanban-managed scratch root.
 
@@ -4199,54 +4618,8 @@ def _is_managed_scratch_path(p: Path) -> bool:
     real source tree can otherwise pair with ``workspace_kind='scratch'`` and
     cause task completion to delete user data (#28818).
     """
-    try:
-        p_abs = p.resolve(strict=False)
-    except OSError:
-        return False
-    roots: list[Path] = []
-    override = os.environ.get("HERMES_KANBAN_WORKSPACES_ROOT", "").strip()
-    if override:
-        try:
-            roots.append(Path(override).expanduser().resolve(strict=False))
-        except OSError:
-            pass
-    try:
-        home = kanban_home()
-    except OSError:
-        home = None
-    if home is not None:
-        try:
-            roots.append((home / "kanban" / "workspaces").resolve(strict=False))
-        except OSError:
-            pass
-        try:
-            boards_parent = (home / "kanban" / "boards").resolve(strict=False)
-        except OSError:
-            boards_parent = None
-        if boards_parent is not None:
-            try:
-                entries = list(boards_parent.iterdir())
-            except OSError:
-                entries = []
-            for entry in entries:
-                try:
-                    if not entry.is_dir():
-                        continue
-                except OSError:
-                    continue
-                try:
-                    roots.append((entry / "workspaces").resolve(strict=False))
-                except OSError:
-                    continue
-    for root in roots:
-        if p_abs == root:
-            continue
-        try:
-            if p_abs.is_relative_to(root):
-                return True
-        except ValueError:
-            continue
-    return False
+    is_managed, _board = _managed_scratch_path_info(p)
+    return is_managed
 
 
 def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
@@ -4487,6 +4860,24 @@ def edit_completed_task_result(
         ).fetchone()
         if not row or row["status"] != "done":
             return False
+        completion = conn.execute(
+            """
+            SELECT payload FROM task_events
+             WHERE task_id = ? AND kind = 'completed'
+             ORDER BY id DESC
+             LIMIT 1
+            """,
+            (task_id,),
+        ).fetchone()
+        if completion and completion["payload"]:
+            try:
+                completion_payload = json.loads(completion["payload"])
+            except (TypeError, json.JSONDecodeError):
+                completion_payload = {}
+            if not isinstance(completion_payload, dict):
+                completion_payload = {}
+            if completion_payload.get("worker_authenticated") is True:
+                return False
         conn.execute(
             "UPDATE tasks SET result = ? WHERE id = ?",
             (result, task_id),
@@ -6789,7 +7180,9 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     ``"recent_success"``
         A completed run exists within ``_RESPAWN_GUARD_SUCCESS_WINDOW``
         seconds.  Useful work already succeeded for this task; wait for
-        human review rather than immediately re-spawning.
+        human review rather than immediately re-spawning. Bypassed when an
+        explicit re-queue event (status change, promote, unblock, reclaim)
+        arrives AFTER that completion — that's a deliberate re-run request.
 
     ``"active_pr"``
         A GitHub PR URL appears in a recent task comment (within
@@ -6852,13 +7245,29 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         return "blocker_auth"
 
     # 3. Completed run within guard window — proof of recent success.
+    #    Exception: an explicit re-queue AFTER that success (an operator
+    #    dragging done→ready, a dependency re-promotion, an unblock, a
+    #    reclaim) is a deliberate "run it again" — honor it instead of
+    #    deferring. Without this, a manual done→ready just sits there,
+    #    silently held by the guard, until the window elapses.
     cutoff = now - _RESPAWN_GUARD_SUCCESS_WINDOW
-    if conn.execute(
-        "SELECT id FROM task_runs "
-        "WHERE task_id = ? AND outcome = 'completed' AND ended_at >= ?",
+    recent_completed = conn.execute(
+        "SELECT ended_at FROM task_runs "
+        "WHERE task_id = ? AND outcome = 'completed' AND ended_at >= ? "
+        "ORDER BY ended_at DESC LIMIT 1",
         (task_id, cutoff),
-    ).fetchone():
-        return "recent_success"
+    ).fetchone()
+    if recent_completed:
+        completed_at = int(recent_completed["ended_at"] or 0)
+        requeued_after = conn.execute(
+            "SELECT 1 FROM task_events "
+            "WHERE task_id = ? AND created_at >= ? "
+            "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed') "
+            "LIMIT 1",
+            (task_id, completed_at),
+        ).fetchone()
+        if not requeued_after:
+            return "recent_success"
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
@@ -7728,6 +8137,8 @@ def _default_spawn(
         env["HERMES_KANBAN_BRANCH"] = task.branch_name
     if task.current_run_id is not None:
         env["HERMES_KANBAN_RUN_ID"] = str(task.current_run_id)
+    if task.worker_token:
+        env["HERMES_KANBAN_WORKER_TOKEN"] = task.worker_token
     if task.claim_lock:
         env["HERMES_KANBAN_CLAIM_LOCK"] = task.claim_lock
     # Goal-loop mode: the worker reads these and wraps its run in the
@@ -7768,9 +8179,18 @@ def _default_spawn(
     # attributed correctly regardless of how the child loads config.
     env["HERMES_PROFILE"] = profile_arg
 
+    # A worker must NEVER boot the interactive TUI: an inherited HERMES_TUI=1
+    # or a `display.interface: tui` in the profile's config would send the
+    # quiet chat run into the Ink TUI, whose no-TTY bail-out exits 0 without
+    # doing the task → "protocol violation" on every attempt. `--cli` is the
+    # highest-precedence interface override; dropping the env var covers
+    # older hermes builds on PATH that predate the flag's precedence.
+    env.pop("HERMES_TUI", None)
+
     cmd = [
         *_resolve_hermes_argv(),
         "-p", profile_arg,
+        "--cli",
         # Worker subprocesses switch to a profile-scoped HERMES_HOME above,
         # so they see that profile's shell-hook allowlist instead of the
         # dispatcher's root allowlist. Pass --accept-hooks explicitly so
@@ -7795,6 +8215,13 @@ def _default_spawn(
         "chat",
         "-q", prompt,
     ])
+    if task.goal_mode:
+        # Goal-mode workers must take the fully-quiet single-query path:
+        # the kanban goal-loop hook (_run_kanban_goal_loop_q) only runs in
+        # cli.py's quiet branch. Without -Q the worker gets exactly one
+        # turn, prints text, exits rc=0, and the dispatcher records a
+        # protocol violation (incident 2026-06-09 t_d9cbe312).
+        cmd.append("-Q")
     # Redirect output to a per-task log under <board-root>/logs/.
     # Anchored at the board root (not the shared kanban root), so
     # `hermes kanban log` on a specific board reads its own file and
