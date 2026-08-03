@@ -1153,20 +1153,24 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
             _tg_proxy = resolve_proxy_url("TELEGRAM_PROXY", target_hosts=["api.telegram.org"])
         except Exception:
             _tg_proxy = None
+        # Telegram can hold sendDocument/sendPhoto responses for 30s+ when the
+        # bot is under flood control; PTB's 5s default read timeout then fails
+        # every media send even though the upload itself is fine.
+        _tg_timeouts = dict(connect_timeout=10.0, read_timeout=120.0, write_timeout=120.0, pool_timeout=10.0)
+        from telegram.request import HTTPXRequest
         if _tg_proxy:
             try:
-                from telegram.request import HTTPXRequest
                 logger.info("send_message: standalone Telegram send routed through proxy %s", _tg_proxy)
                 bot = Bot(
                     token=token,
-                    request=HTTPXRequest(proxy=_tg_proxy),
-                    get_updates_request=HTTPXRequest(proxy=_tg_proxy),
+                    request=HTTPXRequest(proxy=_tg_proxy, **_tg_timeouts),
+                    get_updates_request=HTTPXRequest(proxy=_tg_proxy, **_tg_timeouts),
                 )
             except Exception as _proxy_err:
                 logger.warning("send_message: failed to attach Telegram proxy (%s), falling back to direct connection", _proxy_err)
-                bot = Bot(token=token)
+                bot = Bot(token=token, request=HTTPXRequest(**_tg_timeouts))
         else:
-            bot = Bot(token=token)
+            bot = Bot(token=token, request=HTTPXRequest(**_tg_timeouts))
         from plugins.platforms.telegram.telegram_ids import (
             normalize_telegram_chat_id,
         )
